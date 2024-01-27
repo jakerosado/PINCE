@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import QApplication, QMainWindow, QTableWidgetItem, QMessag
     QComboBox, QDialogButtonBox, QCheckBox, QHBoxLayout, QPushButton, QFrame, QSpacerItem, QSizePolicy
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QByteArray, QSettings, QEvent, QKeyCombination, QTranslator, \
     QItemSelectionModel, QTimer, QModelIndex, QStringListModel, QRegularExpression, QRunnable, QObject, QThreadPool, \
-    QLocale, QSignalBlocker
+    QLocale, QSignalBlocker, QItemSelection
 from typing import Final
 from time import sleep, time
 import os, sys, traceback, signal, re, copy, io, queue, collections, ast, pexpect, json, select
@@ -555,6 +555,10 @@ class MainForm(QMainWindow, MainWindow):
             QRegularExpressionValidator(QRegularExpression("-?[0-9]*"), parent=self.lineEdit_Scan))
         self.lineEdit_Scan2.setValidator(
             QRegularExpressionValidator(QRegularExpression("-?[0-9]*"), parent=self.lineEdit_Scan2))
+        self.lineEdit_Scan.keyPressEvent_original = self.lineEdit_Scan.keyPressEvent
+        self.lineEdit_Scan2.keyPressEvent_original = self.lineEdit_Scan2.keyPressEvent
+        self.lineEdit_Scan.keyPressEvent = self.lineEdit_Scan_on_key_press_event
+        self.lineEdit_Scan2.keyPressEvent = self.lineEdit_Scan2_on_key_press_event
         self.comboBox_ScanType.currentIndexChanged.connect(self.comboBox_ScanType_current_index_changed)
         self.comboBox_ScanType_current_index_changed()
         self.pushButton_Settings.clicked.connect(self.pushButton_Settings_clicked)
@@ -880,7 +884,6 @@ class MainForm(QMainWindow, MainWindow):
             frozen = row.data(FROZEN_COL, Qt.ItemDataRole.UserRole)
             frozen.freeze_type = freeze_type
 
-            # TODO: Create a QWidget subclass with signals so freeze type can be changed by clicking on the cell
             if freeze_type == typedefs.FREEZE_TYPE.DEFAULT:
                 row.setText(FROZEN_COL, "")
                 row.setForeground(FROZEN_COL, QBrush())
@@ -1101,6 +1104,19 @@ class MainForm(QMainWindow, MainWindow):
             value = "" if value is None else str(value)
             row.setText(VALUE_COL, value)
 
+    def scan_values(self):
+        global threadpool
+        if debugcore.currentpid == -1:
+            return
+        search_for = self.validate_search(self.lineEdit_Scan.text(), self.lineEdit_Scan2.text())
+        self.QWidget_Toolbox.setEnabled(False)
+        self.progressBar.setValue(0)
+        self.progress_bar_timer = QTimer(timeout=self.update_progress_bar)
+        self.progress_bar_timer.start(100)
+        scan_thread = Worker(scanmem.send_command, search_for)
+        scan_thread.signals.finished.connect(self.scan_callback)
+        threadpool.start(scan_thread)
+
     def resize_address_table(self):
         self.treeWidget_AddressTable.resizeColumnToContents(FROZEN_COL)
 
@@ -1142,7 +1158,6 @@ class MainForm(QMainWindow, MainWindow):
             self.lineEdit_Scan.setValidator(QRegularExpressionValidator(self.qRegExp_dec, parent=self.lineEdit_Scan))
             self.lineEdit_Scan2.setValidator(QRegularExpressionValidator(self.qRegExp_dec, parent=self.lineEdit_Scan2))
 
-    # TODO add a damn keybind for this...
     def pushButton_NewFirstScan_clicked(self):
         if debugcore.currentpid == -1:
             self.comboBox_ScanType_init()
@@ -1154,7 +1169,6 @@ class MainForm(QMainWindow, MainWindow):
             self.pushButton_NewFirstScan.setText(tr.NEW_SCAN)
             self.comboBox_ValueType.setEnabled(False)
             self.pushButton_NextScan.setEnabled(True)
-            self.pushButton_UndoScan.setEnabled(True)
             search_scope = self.comboBox_ScanScope.currentData(Qt.ItemDataRole.UserRole)
             endian = self.comboBox_Endianness.currentData(Qt.ItemDataRole.UserRole)
             scanmem.send_command(f"option region_scan_level {search_scope}")
@@ -1162,11 +1176,38 @@ class MainForm(QMainWindow, MainWindow):
             scanmem.reset()
             self.comboBox_ScanScope.setEnabled(False)
             self.comboBox_Endianness.setEnabled(False)
-            self.pushButton_NextScan_clicked()  # makes code a little simpler to just implement everything in nextscan
+            self.scan_values()
         self.comboBox_ScanType_init()
 
+    def handle_line_edit_scan_key_press_event(self, event):
+        valid_keys = [Qt.Key.Key_Return, Qt.Key.Key_Enter]
+        if event.key() in valid_keys and Qt.KeyboardModifier.ControlModifier in event.modifiers():
+            self.pushButton_NewFirstScan_clicked()
+            return
+
+        if event.key() in valid_keys:
+            if self.scan_mode == typedefs.SCAN_MODE.ONGOING:
+                self.pushButton_NextScan_clicked()
+            else:
+                self.pushButton_NewFirstScan_clicked()
+            return
+        
+    def lineEdit_Scan_on_key_press_event(self, event):
+        self.handle_line_edit_scan_key_press_event(event)
+        self.lineEdit_Scan.keyPressEvent_original(event)
+
+    def lineEdit_Scan2_on_key_press_event(self, event):
+        self.handle_line_edit_scan_key_press_event(event)
+        self.lineEdit_Scan2.keyPressEvent_original(event)
+
     def pushButton_UndoScan_clicked(self):
-        self.pushButton_NextScan_clicked("undo")
+        global threadpool
+        if debugcore.currentpid == -1:
+            return
+        undo_thread = Worker(scanmem.undo_scan)
+        undo_thread.signals.finished.connect(self.scan_callback)
+        threadpool.start(undo_thread)
+        self.pushButton_UndoScan.setEnabled(False)  # we can undo once so set it to false and re-enable at next scan
 
     def comboBox_ScanType_current_index_changed(self):
         hidden_types = [typedefs.SCAN_TYPE.INCREASED, typedefs.SCAN_TYPE.DECREASED, typedefs.SCAN_TYPE.CHANGED,
@@ -1268,22 +1309,9 @@ class MainForm(QMainWindow, MainWindow):
             return cmp_symbols[type_index] + " " + search_for
         return search_for
 
-    def pushButton_NextScan_clicked(self, search_for=None):
-        global threadpool
-        if debugcore.currentpid == -1:
-            return
-        if not search_for:
-            search_for = self.validate_search(self.lineEdit_Scan.text(), self.lineEdit_Scan2.text())
-        self.QWidget_Toolbox.setEnabled(False)
-        self.progressBar.setValue(0)
-        self.progress_bar_timer = QTimer(timeout=self.update_progress_bar)
-        self.progress_bar_timer.start(100)
-        if search_for == "undo":
-            scan_thread = Worker(scanmem.undo_scan)
-        else:
-            scan_thread = Worker(scanmem.send_command, search_for)
-        scan_thread.signals.finished.connect(self.scan_callback)
-        threadpool.start(scan_thread)
+    def pushButton_NextScan_clicked(self):
+        self.scan_values()
+        self.pushButton_UndoScan.setEnabled(True)
 
     def scan_callback(self):
         self.progress_bar_timer.stop()
@@ -1613,14 +1641,35 @@ class MainForm(QMainWindow, MainWindow):
                 debugcore.write_memory(address, vt.value_index, value, vt.zero_terminate, vt.endian)
             it += 1
 
-    def treeWidget_AddressTable_item_clicked(self, row, column):
+    def treeWidget_AddressTable_item_clicked(self, row: QTreeWidgetItem, column: int):
         if column == FROZEN_COL:
-            if row.checkState(FROZEN_COL) == Qt.CheckState.Checked:
-                frozen = row.data(FROZEN_COL, Qt.ItemDataRole.UserRole)
-                frozen.value = row.text(VALUE_COL)
-            else:
-                row.setText(FROZEN_COL, "")
-                row.setForeground(FROZEN_COL, QBrush())
+            frozen: typedefs.Frozen = row.data(FROZEN_COL, Qt.ItemDataRole.UserRole)
+            is_checked = row.checkState(FROZEN_COL) == Qt.CheckState.Checked
+            is_frozen = frozen.enabled
+
+            frozen_state_toggled = is_checked and not is_frozen or not is_checked and is_frozen
+            # this helps determine whether the user clicked checkbox or the text
+            # if the user clicked the text, change the freeze type
+
+            if not frozen_state_toggled and is_checked:
+                # user clicked the text, iterate through the freeze type
+                if frozen.freeze_type == typedefs.FREEZE_TYPE.DECREMENT: 
+                    # decrement is the last freeze type
+                    self.change_freeze_type(typedefs.FREEZE_TYPE.DEFAULT)
+                else:
+                    self.change_freeze_type(frozen.freeze_type + 1)
+
+            if frozen_state_toggled:
+                if is_checked:
+                    frozen.enabled = True
+                    # reapply the freeze type, to reflect the current freeze type in the UI
+                    # otherwise the UI will show DEFAULT freeze type after enabling instead of the actual type
+                    self.change_freeze_type(frozen.freeze_type)
+                    frozen.value = row.text(VALUE_COL)
+                else:
+                    frozen.enabled = False # it has just been toggled off
+                    self.change_freeze_type(typedefs.FREEZE_TYPE.DEFAULT)
+
 
     def treeWidget_AddressTable_change_repr(self, new_repr):
         value_type = guiutils.get_current_item(self.treeWidget_AddressTable).data(TYPE_COL, Qt.ItemDataRole.UserRole)
@@ -1758,16 +1807,15 @@ class ProcessForm(QMainWindow, ProcessWindow):
         processlist = utils.search_processes(text)
         self.refresh_process_table(self.tableWidget_ProcessTable, processlist)
 
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape:
-            # closes the window whenever ESC key is pressed
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
             self.close()
-        elif e.key() == Qt.Key.Key_Return:
+        elif event.key() == Qt.Key.Key_Return:
             self.pushButton_Open_clicked()
-        elif e.key() == Qt.Key.Key_F1:
+        elif event.key() == Qt.Key.Key_F1:
             self.pushButton_CreateProcess_clicked()
-        elif e.key() == Qt.Key.Key_Down or e.key() == Qt.Key.Key_Up:
-            self.tableWidget_ProcessTable.keyPressEvent(QKeyEvent(QEvent.KeyPress, e.key(), Qt.NoModifier))
+        else:
+            return super().keyPressEvent(event)
 
     # lists currently working processes to table
     def refresh_process_table(self, tablewidget, processlist):
@@ -1781,6 +1829,12 @@ class ProcessForm(QMainWindow, ProcessWindow):
 
     # gets the pid out of the selection to attach
     def pushButton_Open_clicked(self):
+        index = self.tableWidget_ProcessTable.currentIndex()
+        row_count = self.tableWidget_ProcessTable.rowCount()
+        if index.row() == -1 and row_count == 1:
+            # autoselect first row if there is only one row
+            self.tableWidget_ProcessTable.setCurrentCell(0, 0)
+            
         current_item = self.tableWidget_ProcessTable.item(self.tableWidget_ProcessTable.currentIndex().row(), 0)
         if current_item is None:
             QMessageBox.information(self, tr.ERROR, tr.SELECT_PROCESS)
@@ -2844,7 +2898,7 @@ class MemoryViewWindowForm(QMainWindow, MemoryViewWindow):
         self.tableWidget_Disassemble.itemSelectionChanged.connect(self.tableWidget_Disassemble_item_selection_changed)
 
     def initialize_hex_view(self):
-        self.hex_view_last_selected_address_int = 0
+        self.hex_view_last_selected_address = 0
         self.hex_view_current_region = typedefs.tuple_region_info(0, 0, None, None)
         self.hex_model = QHexModel(HEX_VIEW_ROW_COUNT, HEX_VIEW_COL_COUNT)
         self.ascii_model = QAsciiModel(HEX_VIEW_ROW_COUNT, HEX_VIEW_COL_COUNT)
@@ -2859,10 +2913,6 @@ class MemoryViewWindowForm(QMainWindow, MemoryViewWindow):
         self.tableView_HexView_Hex.contextMenuEvent = self.widget_HexView_context_menu_event
         self.tableView_HexView_Ascii.contextMenuEvent = self.widget_HexView_context_menu_event
 
-        # Ignoring the event sends it directly to the parent, which is widget_HexView
-        self.tableView_HexView_Hex.keyPressEvent = QEvent.ignore
-        self.tableView_HexView_Ascii.keyPressEvent = QEvent.ignore
-
         self.bHexViewScrolling = False  # rejects new scroll requests while scrolling
         self.verticalScrollBar_HexView.wheelEvent = QEvent.ignore
         self.verticalScrollBar_HexView.sliderChange = self.hex_view_scrollbar_sliderchanged
@@ -2872,8 +2922,8 @@ class MemoryViewWindowForm(QMainWindow, MemoryViewWindow):
         self.tableWidget_HexView_Address.setAutoScroll(False)
         self.tableWidget_HexView_Address.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
 
-        self.tableView_HexView_Hex.selectionModel().currentChanged.connect(self.on_hex_view_current_changed)
-        self.tableView_HexView_Ascii.selectionModel().currentChanged.connect(self.on_ascii_view_current_changed)
+        self.tableView_HexView_Hex.selectionModel().selectionChanged.connect(self.hex_view_selection_changed)
+        self.tableView_HexView_Ascii.selectionModel().selectionChanged.connect(self.hex_view_selection_changed)
 
         self.scrollArea_Hex.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scrollArea_Hex.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -3112,24 +3162,75 @@ class MemoryViewWindowForm(QMainWindow, MemoryViewWindow):
         guiutils.center_scroll_bar(self.verticalScrollBar_Disassemble)
         self.bDisassemblyScrolling = False
 
-    def on_hex_view_current_changed(self, QModelIndex_current):
-        if debugcore.currentpid == -1:
-            return
-        self.tableWidget_HexView_Address.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.tableView_HexView_Ascii.selectionModel().setCurrentIndex(QModelIndex_current,
-                                                                      QItemSelectionModel.SelectionFlag.ClearAndSelect)
-        self.tableWidget_HexView_Address.selectRow(QModelIndex_current.row())
-        self.hex_view_last_selected_address_int = self.tableView_HexView_Hex.get_selected_address()
+    def hex_view_selection_changed(self, selected, deselected):
+        sender_selection_model: QItemSelectionModel = self.sender()
+        if sender_selection_model == self.tableView_HexView_Hex.selectionModel():
+            other_selection_model = self.tableView_HexView_Ascii.selectionModel()
+        else:
+            other_selection_model = self.tableView_HexView_Hex.selectionModel()
+        sender_selection = sorted([(idx.row(), idx.column()) for idx in sender_selection_model.selectedIndexes()])
+        first_selection = sender_selection[0]
+        last_selection = sender_selection[-1]
+        if len(sender_selection) == 1:
+            self.hex_selection_start = first_selection
+            self.hex_selection_end = first_selection
+        else:
+            # Selection ends in top left
+            if last_selection == self.hex_selection_start:
+                self.hex_selection_end = first_selection
+            # Selection ends in top right
+            elif last_selection[0] == self.hex_selection_start[0]:
+                self.hex_selection_end = (first_selection[0], last_selection[1])
+            # Selection ends in bottom left
+            elif last_selection[1] == self.hex_selection_start[1]:
+                self.hex_selection_end = (last_selection[0], first_selection[1])
+            # Selection ends in bottom right
+            else:
+                self.hex_selection_end = last_selection
+        with QSignalBlocker(sender_selection_model), QSignalBlocker(other_selection_model):
+            sender_selection_model.clearSelection()
+            other_selection_model.clearSelection()
+            if self.hex_selection_start < self.hex_selection_end:
+                start_point = self.hex_selection_start
+                end_point = self.hex_selection_end
+            else:
+                start_point = self.hex_selection_end
+                end_point = self.hex_selection_start
+            if start_point[0] == end_point[0]:
+                start = sender_selection_model.model().index(*start_point)
+                end = sender_selection_model.model().index(*end_point)
+                selection = QItemSelection(start, end)
+                sender_selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
+                other_selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
+            else:
+                # First line
+                start = sender_selection_model.model().index(*start_point)
+                end = sender_selection_model.model().index(start_point[0], HEX_VIEW_COL_COUNT-1)
+                selection = QItemSelection(start, end)
+                sender_selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
+                other_selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
+                # Middle
+                if end_point[0]-start_point[0] > 1:
+                    start = sender_selection_model.model().index(start_point[0]+1, 0)
+                    end = sender_selection_model.model().index(end_point[0]-1, HEX_VIEW_COL_COUNT-1)
+                    selection = QItemSelection(start, end)
+                    sender_selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
+                    other_selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
+                # Last line
+                start = sender_selection_model.model().index(end_point[0], 0)
+                end = sender_selection_model.model().index(*end_point)
+                selection = QItemSelection(start, end)
+                sender_selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
+                other_selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
+        self.tableWidget_HexView_Address.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.tableWidget_HexView_Address.clearSelection()
+        for row in range(start_point[0], end_point[0]+1):
+            self.tableWidget_HexView_Address.selectRow(row)
         self.tableWidget_HexView_Address.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-
-    def on_ascii_view_current_changed(self, QModelIndex_current):
-        if debugcore.currentpid == -1:
-            return
-        self.tableWidget_HexView_Address.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.tableView_HexView_Hex.selectionModel().setCurrentIndex(QModelIndex_current,
-                                                                    QItemSelectionModel.SelectionFlag.ClearAndSelect)
-        self.tableWidget_HexView_Address.selectRow(QModelIndex_current.row())
-        self.tableWidget_HexView_Address.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.hex_view_last_selected_address = self.tableView_HexView_Hex.get_selected_address()
+        self.tableView_HexView_Hex.update()
+        self.tableView_HexView_Ascii.update()
+        self.tableWidget_HexView_Address.update()
 
     def hex_update_loop(self):
         if debugcore.currentpid == -1 or exiting:
@@ -3170,7 +3271,7 @@ class MemoryViewWindowForm(QMainWindow, MemoryViewWindow):
         self.ascii_model.refresh(int_address, offset, data_array, breakpoint_info)
         for index in range(offset):
             current_address = utils.modulo_address(self.hex_model.current_address + index, debugcore.inferior_arch)
-            if current_address == self.hex_view_last_selected_address_int:
+            if current_address == self.hex_view_last_selected_address:
                 row_index = int(index / HEX_VIEW_COL_COUNT)
                 model_index = QModelIndex(self.hex_model.index(row_index, index % HEX_VIEW_COL_COUNT))
                 self.tableView_HexView_Hex.selectionModel().setCurrentIndex(model_index,
@@ -4488,6 +4589,8 @@ class TrackWatchpointWidgetForm(QWidget, TrackWatchpointWidget):
         self.update_timer = QTimer(timeout=self.update_list)
         self.stopped = False
         self.address = address
+        self.info = {}
+        self.last_selected_row = 0
         if watchpoint_type == typedefs.WATCHPOINT_TYPE.WRITE_ONLY:
             string = tr.OPCODE_WRITING_TO.format(address)
         elif watchpoint_type == typedefs.WATCHPOINT_TYPE.READ_ONLY:
@@ -4497,13 +4600,11 @@ class TrackWatchpointWidgetForm(QWidget, TrackWatchpointWidget):
         else:
             raise Exception("Watchpoint type is invalid: " + str(watchpoint_type))
         self.setWindowTitle(string)
-        breakpoints = debugcore.track_watchpoint(address, length, watchpoint_type)
-        if not breakpoints:
+        self.breakpoints = debugcore.track_watchpoint(address, length, watchpoint_type)
+        if not self.breakpoints:
             QMessageBox.information(self, tr.ERROR, tr.TRACK_WATCHPOINT_FAILED.format(address))
+            self.close()
             return
-        self.breakpoints = breakpoints
-        self.info = {}
-        self.last_selected_row = 0
         self.pushButton_Stop.clicked.connect(self.pushButton_Stop_clicked)
         self.pushButton_Refresh.clicked.connect(self.update_list)
         self.tableWidget_Opcodes.itemDoubleClicked.connect(self.tableWidget_Opcodes_item_double_clicked)
@@ -4580,16 +4681,16 @@ class TrackBreakpointWidgetForm(QWidget, TrackBreakpointWidget):
         self.update_values_timer = QTimer(timeout=self.update_values)
         self.stopped = False
         self.address = address
+        self.info = {}
+        self.last_selected_row = 0
         self.setWindowFlags(Qt.WindowType.Window)
         guiutils.center_to_parent(self)
         self.setWindowTitle(tr.ACCESSED_BY_INSTRUCTION.format(instruction))
-        breakpoint = debugcore.track_breakpoint(address, register_expressions)
-        if not breakpoint:
+        self.breakpoint = debugcore.track_breakpoint(address, register_expressions)
+        if not self.breakpoint:
             QMessageBox.information(self, tr.ERROR, tr.TRACK_BREAKPOINT_FAILED.format(address))
+            self.close()
             return
-        self.breakpoint = breakpoint
-        self.info = {}
-        self.last_selected_row = 0
         guiutils.fill_value_combobox(self.comboBox_ValueType)
         self.pushButton_Stop.clicked.connect(self.pushButton_Stop_clicked)
         self.tableWidget_TrackInfo.itemDoubleClicked.connect(self.tableWidget_TrackInfo_item_double_clicked)

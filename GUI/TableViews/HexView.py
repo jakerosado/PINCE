@@ -14,6 +14,7 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
+from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import QTableView, QAbstractItemView
 from PyQt6.QtCore import Qt
 from GUI.ItemDelegates.HexDelegate import QHexDelegate
@@ -31,7 +32,7 @@ class QHexView(QTableView):
         self.horizontalHeader().setMinimumSectionSize(25)
         self.horizontalHeader().setDefaultSectionSize(25)
         self.setShowGrid(False)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setAutoScroll(False)
@@ -43,23 +44,28 @@ class QHexView(QTableView):
     def wheelEvent(self, QWheelEvent):
         QWheelEvent.ignore()
 
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_Return and self.state() != QAbstractItemView.State.EditingState:
+            self.edit(self.currentIndex())
+        else:
+            return super().keyPressEvent(event)
+
     def resize_to_contents(self):
         size = self.columnWidth(0) * self.model().columnCount()
         self.setMinimumWidth(size)
         self.setMaximumWidth(size)
 
     def get_selected_address(self):
-        index_list = self.selectionModel().selectedIndexes()  # Use selectionModel instead of currentIndex
+        cell = self.currentIndex()
         model: QHexModel = self.model()
         current_address = model.current_address
-        if index_list:
-            cell = index_list[0]
+        if cell:
             current_address = current_address + cell.row() * model.columnCount() + cell.column()
         return utils.modulo_address(current_address, debugcore.inferior_arch)
 
     def on_editor_close(self):
         model: QHexModel = self.model()
-        cell = self.selectionModel().selectedIndexes()[0]
+        cell = self.currentIndex()
         index = cell.row() * model.columnCount() + cell.column()
         address = utils.modulo_address(model.current_address + index, debugcore.inferior_arch)
         data = self.delegate.editor.text()
